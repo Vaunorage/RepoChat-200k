@@ -7,6 +7,7 @@ import nbformat
 import requests
 from git import Repo, GitCommandError, NoSuchPathError, InvalidGitRepositoryError
 from loguru import logger
+from paths import REPOS_DIR
 from send2trash import send2trash
 import pandas as pd
 from pygments.lexers import guess_lexer_for_filename, TextLexer
@@ -59,32 +60,57 @@ def retry(max_retries=3, retry_delay=5):
                 raise last_exception  # if an exception occurred, raise it
             else:
                 # usually this should not happen
-                raise Exception(f"Failed to execute {func.__name__} after {max_retries} retries without catching an exception.")
-        return wrapper
-    return decorator
+                raise Exception(
+                    f"Failed to execute {func.__name__} after {max_retries} retries without catching an exception.")
 
+        return wrapper
+
+    return decorator
 
 
 class RepoService:
     def __init__(self, repo_url, repo_name=None):
         self.repo_url = repo_url
-        self.repo_name = repo_name if repo_name else repo_url.split(
-            "/")[-1].replace(".git", "")
-        self.repo_path = os.path.join(Config["repos_dir"], self.repo_name)
-        self.clone_path = os.path.join(
-            self.repo_path, self.repo_name + "-main")
+        self.repo_name = repo_name if repo_name else repo_url.split("/")[-1].replace(".git", "")
+        self.repo_path = REPOS_DIR.joinpath(self.repo_name)
+        self.clone_path = self.repo_path.joinpath(self.repo_name + "-main")
+        self.clone_path.mkdir(exist_ok=True, parents=True)
+        self.auth_key = os.getenv('GITHUB_TOKEN')
+        self.repo = Repo(self.clone_path)
+        self.current_branch = self.repo.active_branch.name
 
         if self.check_if_exist():
-            logger.info(
-                f"Repository {self.repo_name} already exists at {self.repo_path}")
+            logger.info(f"Repository {self.repo_name} already exists at {self.repo_path}")
         else:
             self.set_up()
 
-    def check_if_exist(self):
-        repo_info_path = os.path.join(self.repo_path, "repo_info.json")
-        csv_path = os.path.join(self.repo_path, "repo_stats.csv")
+    def get_branches(self):
+        try:
+            # Fetch all branches including remotes
+            self.repo.git.fetch('--all')
 
-        if not os.path.exists(repo_info_path) or not os.path.exists(csv_path):
+            # Get local branches
+            local_branches = [ref.name for ref in self.repo.heads]
+
+            # Get remote branches and remove the 'origin/' prefix
+            remote_branches = [ref.name.split('/', 1)[1] for ref in self.repo.remotes.origin.refs if '/' in ref.name]
+
+            # Combine and remove duplicates
+            all_branches = list(set(local_branches + remote_branches))
+
+            # Sort branches alphabetically
+            all_branches.sort()
+
+            return all_branches
+        except GitCommandError as e:
+            logger.error(f"Failed to get branches: {e}")
+            return []
+
+    def check_if_exist(self):
+        repo_info_path = self.repo_path.joinpath("repo_info.json")
+        csv_path = self.repo_path.joinpath("repo_stats.csv")
+
+        if not repo_info_path.exists() or not csv_path.exists():
             return False
         if pd.read_csv(csv_path).empty:
             return False
@@ -103,20 +129,19 @@ class RepoService:
         if not os.path.exists(self.repo_path):
             os.makedirs(self.repo_path, exist_ok=True)
         repo_info = {"repo_url": self.repo_url}
-        with open(os.path.join(self.repo_path, "repo_info.json"), "w") as f:
+        with open(self.repo_path.joinpath("repo_info.json"), "w") as f:
             json.dump(repo_info, f)
         self.clone_repo()
-        if not os.path.exists(os.path.join(self.repo_path, "repo_stats.csv")):
+        if not self.repo_path.joinpath("repo_stats.csv").exists():
             self.get_repo_stats()
         logger.info(
             f"Repository {self.repo_name} set up successfully at {self.repo_path}")
         logger.info(
-            f"Last updated: {time.ctime(os.path.getmtime(os.path.join(self.repo_path, 'repo_stats.csv')))}")
+            f"Last updated: {time.ctime(os.path.getmtime(self.repo_path.joinpath('repo_stats.csv')))}")
 
     def clone_repo(self):
         if os.path.exists(self.clone_path) and os.listdir(self.clone_path):
-            logger.info(
-                f"The repository {self.repo_name} already exists at {self.clone_path}.")
+            logger.info(f"The repository {self.repo_name} already exists at {self.clone_path}.")
             return True
 
         os.makedirs(self.clone_path, exist_ok=True)
@@ -132,19 +157,16 @@ class RepoService:
             logger.info("Git clone failed. Trying HTTP download.")
             return self.try_clone_using_http()
 
-        logger.error(
-            f"Invalid download method specified in config: {download_method}")
+        logger.error(f"Invalid download method specified in config: {download_method}")
         return False
 
     def try_clone_using_git(self):
         try:
-            subprocess.run(["git", "--version"], check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "--version"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self._clone_using_git()
             return True
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            logger.error(
-                f"Failed to clone repository {self.repo_name} using Git. {e}")
+            logger.error(f"Failed to clone repository {self.repo_name} using Git. {e}")
             self.delete_repo()
             return False
 
@@ -153,21 +175,28 @@ class RepoService:
             self._clone_using_download()
             return True
         except (requests.exceptions.RequestException, zipfile.BadZipFile) as e:
-            logger.error(
-                f"Failed to clone repository {self.repo_name} using HTTP download method. {e}")
+            logger.error(f"Failed to clone repository {self.repo_name} using HTTP download method. {e}")
             self.delete_repo()
             return False
 
     @retry(max_retries=1, retry_delay=5)
     def _clone_using_git(self):
         logger.info(f"Cloning repository {self.repo_name} using Git...")
-        subprocess.run(["git", "clone", self.repo_url,
-                       self.clone_path], check=True, timeout=60)
+        if self.auth_key:
+            # Use HTTPS with token authentication
+            auth_url = self.repo_url.replace("https://", f"https://{self.auth_key}@")
+            subprocess.run(["git", "clone", auth_url, self.clone_path], check=True, timeout=60)
+        else:
+            subprocess.run(["git", "clone", self.repo_url, self.clone_path], check=True, timeout=60)
 
     @retry(max_retries=1, retry_delay=5)
     def _clone_using_download(self):
         logger.info(f"Cloning repository {self.repo_name} using download...")
-        response = requests.get(self.repo_url, timeout=60)
+        headers = {}
+        if self.auth_key:
+            headers['Authorization'] = f'token {self.auth_key}'
+
+        response = requests.get(self.repo_url, headers=headers, timeout=60)
         if response.status_code == 200:
             with open(os.path.join(self.repo_path, "repo.zip"), "wb") as f:
                 f.write(response.content)
@@ -175,35 +204,8 @@ class RepoService:
                 zip_ref.extractall(self.repo_path)
             os.remove(os.path.join(self.repo_path, "repo.zip"))
         else:
-            raise requests.exceptions.RequestException(
-                f"Failed to download repository {self.repo_name}")
+            raise requests.exceptions.RequestException(f"Failed to download repository {self.repo_name}")
 
-    def update_repo(self):
-        try:
-            logger.info(f"Updating repository {self.repo_name}...")
-            repo = Repo(self.clone_path)
-            origin = repo.remotes.origin
-            origin.fetch()  # Fetches the latest changes from the remote repository but does not merge them
-
-            current_commit = repo.head.commit  # get the current commit
-            # get the remote commit
-            remote_commit = origin.refs[repo.active_branch.name].commit
-
-            if current_commit.hexsha == remote_commit.hexsha:
-                logger.info(
-                    f"Repository {self.repo_name} is already up-to-date.")
-                return True  # if the current commit is the same as the remote commit, the repository is up-to-date
-
-            # if the current commit is not the same as the remote commit, pull the changes
-            origin.pull()
-            logger.info(f"Repository {self.repo_name} updated successfully.")
-
-            # after updating the repository, get the latest stats
-            self.get_repo_stats()
-            return True
-        except (GitCommandError, NoSuchPathError, InvalidGitRepositoryError) as e:
-            logger.error(f"Failed to update repository {self.repo_name}: {e}")
-            return False
 
     def delete_repo(self):
         if os.path.exists(self.repo_path):
@@ -355,7 +357,7 @@ class RepoService:
 
             directory_lines = flatten_directory(directory_structure)
             result += 'Directory Structure:\n' + \
-                '\n'.join(directory_lines) + '\n\n'
+                      '\n'.join(directory_lines) + '\n\n'
 
         for _, row in df.iterrows():
             r = result
@@ -387,10 +389,11 @@ class RepoService:
 
         return result.strip()
 
-    def get_filtered_files(self, selected_folders=None, selected_files=None, selected_languages=None, limit=None, concat_method='xml', include_directory=True, metadata_list=None):
+    def get_filtered_files(self, selected_folders=None, selected_files=None, selected_languages=None, limit=None,
+                           concat_method='xml', include_directory=True, metadata_list=None):
         filtered_files = self.filter_files(
             selected_folders=selected_folders, selected_files=selected_files, selected_languages=selected_languages)
-        file_string = self.preprocess_dataframe(filtered_files, limit=limit,  concat_method=concat_method,
+        file_string = self.preprocess_dataframe(filtered_files, limit=limit, concat_method=concat_method,
                                                 include_directory=include_directory, metadata_list=metadata_list)
         return file_string
 
@@ -425,6 +428,48 @@ class RepoService:
         languages = df['language'].dropna().unique()
         return sorted(languages)
 
+    def switch_branch(self, branch_name):
+        try:
+            if branch_name not in self.repo.heads:
+                self.repo.git.checkout('-b', branch_name, f'origin/{branch_name}')
+            else:
+                self.repo.git.checkout(branch_name)
+
+            self.current_branch = branch_name
+            self.get_repo_stats()
+            logger.info(f"Switched to branch: {branch_name}")
+            return True
+        except GitCommandError as e:
+            logger.error(f"Failed to switch to branch {branch_name}: {e}")
+            return False
+
+    def update_repo(self):
+        try:
+            logger.info(f"Updating repository {self.repo_name}...")
+            origin = self.repo.remotes.origin
+
+            if self.auth_key:
+                # Set the remote URL with the auth key
+                auth_url = self.repo_url.replace("https://", f"https://{self.auth_key}@")
+                origin.set_url(auth_url)
+
+            origin.fetch()
+            current_commit = self.repo.head.commit
+            remote_commit = origin.refs[self.current_branch].commit
+
+            if current_commit.hexsha == remote_commit.hexsha:
+                logger.info(f"Repository {self.repo_name} is already up-to-date.")
+                return True
+
+            origin.pull()
+            logger.info(f"Repository {self.repo_name} updated successfully.")
+
+            self.get_repo_stats()
+            return True
+        except GitCommandError as e:
+            logger.error(f"Failed to update repository {self.repo_name}: {e}")
+            return False
+
 
 def singleton(cls):
     instances = {}
@@ -433,6 +478,7 @@ def singleton(cls):
         if cls not in instances:
             instances[cls] = cls(*args, **kwargs)
         return instances[cls]
+
     return get_instance
 
 
@@ -441,15 +487,14 @@ class RepoManager:
     def __init__(self):
         logger.info("Initializing RepoManager...")
         self.repos = {}
-        # if no repo dir
-        if not os.path.exists(Config["repos_dir"]):
-            os.makedirs(Config["repos_dir"], exist_ok=True)
+        if not os.path.exists(REPOS_DIR):
+            os.makedirs(REPOS_DIR, exist_ok=True)
         self.load_repos()
         logger.info(f"Loaded {len(self.repos)} repositories.")
 
     def _find_repos(self):
         repos = []
-        top_level = Config["repos_dir"]
+        top_level = REPOS_DIR
         for repo_dir in os.listdir(top_level):
             repo_path = os.path.join(top_level, repo_dir)
             if os.path.isdir(repo_path):
